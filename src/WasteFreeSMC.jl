@@ -1,5 +1,7 @@
 module WasteFreeSMC
 
+export waste_free_smc
+
 using CovarianceEstimation
 using StatsBase
 using LogExpFunctions
