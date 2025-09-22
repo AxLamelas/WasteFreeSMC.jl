@@ -10,6 +10,10 @@ using SimpleUnPack
 using Distances
 using Primes
 using ProgressMeter
+using ConcreteStructs
+
+
+import LogDensityProblems as LD
 
 struct InterpolatingDensity{P,L}
   ref::P
@@ -18,8 +22,24 @@ struct InterpolatingDensity{P,L}
   dim::Int
 end
 
-function (id::InterpolatingDensity)(θ)
-  id.β * id.mul(θ) + id.ref(θ) 
+LD.dimension(ℓ::InterpolatingDensity) = ℓ.dim
+
+_order(_::LD.LogDensityOrder{K}) where K = K
+function _lowest_capability(ℓ1,ℓs...)
+  o = mapreduce(_order,(a,b) -> a < b,ℓs,init=_order(ℓ1))
+  return LD.LogDensityOrder{o}()
+end
+
+LD.capabilities(ℓ::InterpolatingDensity) = _lowest_capability(ℓ.ref,ℓ.mul)
+
+function LD.logdensity(ℓ::InterpolatingDensity,θ)
+  ℓ.β * LD.logdensity(ℓ.mul,θ) + LD.logdensity(ℓ.ref,θ) 
+end
+
+function LD.logdensity_and_gradient(ℓ::InterpolatingDensity,θ)
+  ref,refgrad = LD.logdensity_and_gradient(ℓ.ref,θ)
+  mul,mulgrad = LD.logdensity_and_gradient(ℓ.mul,θ)
+  ℓ.β * mul + ref, ℓ.β * mulgrad + refgrad
 end
 
 norm2(v::AbstractVector) = dot(v,v)
