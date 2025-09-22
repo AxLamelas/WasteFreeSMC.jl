@@ -53,79 +53,157 @@ function (_::AbstractMCMCKernel{Val{true}})(target,x,logp_x,gradlogp_x,state) en
 
 target_acceptance_rate(_::AbstractMCMCKernel) = 0.237
 
-function logpΔ(logps,bot=1,top=length(logps),rev=false)
-    l,u = rev ? (top,bot) : (bot,top)
-    if top-bot == 0
-        return logps[l]
-    elseif top-bot == 1
-        return logsubexp(logps[l],logps[u])
-    end
-    return logsubexp(
-        logpΔ(logps,bot,top-1,rev),
-        logpΔ(logps,bot+1,top,!rev)
-    )
+# Default kernel initialization
+init_kernel_state(_::AbstractMCMCKernel,x,scale,Σ) = cholesky(Symmetric(scale*Σ))
+
+usesgrad(_::AbstractMCMCKernel{Val{V}}) where {V} = V
+
+Base.@kwdef @concrete struct FisherMALA <: AbstractMCMCKernel{Val{true}}
+  λ = 10.
+  αstar = 0.574
 end
 
-function logα(forward_logps,reverse_logps,level)
-    logpΔ(reverse_logps,1,level,false) - logpΔ(forward_logps,1,level,false)
+target_acceptance_rate(k::FisherMALA) = k.αstar
+
+function init_kernel_state(_::FisherMALA,x,scale,Σ)
+  (;iter=1,σ2 = scale*tr(Σ),R = sqrt(Σ))
 end
 
-function (k::SymmDelayedRejection)(target,x,target_x,C::Cholesky)
-  @unpack levels,factor,proposal_dist = k
-  forward_logps = Vector{eltype(x)}(undef,levels)
-  backward_logps = Vector{eltype(x)}(undef,levels)
-  us = Vector{Vector{eltype(x)}}(undef,levels)
-  n = length(x)
-  us[1] = rand(proposal_dist,n) 
-  y = x + C.L * us[1]
+function (k::FisherMALA)(target,x,logp_x,gradlogp_x,state)
+  @unpack iter,σ2,R = state
+  @unpack λ,αstar = k
 
-  forward_logps[1] = target_x
-  backward_logps[1] = target(y)
+  σ2_rel = σ2/(sum(abs2,R)/length(x))
 
-  α = min(1.,exp(logα(forward_logps,backward_logps,1)))
+  u = randn(length(x))
+  y = x + σ2_rel/2*R*(R'*gradlogp_x) + sqrt(σ2_rel)*R*u
 
-  if rand() < α
-    return y, backward_logps[1], true
+  logp_y,gradlogp_y = LD.logdensity_and_gradient(target,y)
+  
+  α = min(1.,exp(logp_y-logp_x +
+                  1/2*(x-y-σ2_rel/4*R*(R'*gradlogp_y))'*gradlogp_y -
+                  1/2*(y-x-σ2_rel/4*R*(R'*gradlogp_x))'*gradlogp_x 
+                  ))
+
+  s = sqrt(α)*(gradlogp_y-gradlogp_x)
+
+  if iter == 1
+    ϕ = R'*s
+    n = λ + ϕ'*ϕ
+    r = 1/(1+sqrt(λ/n))
+    nextR = 1/sqrt(λ) * (R - r/n * (R*ϕ)*ϕ')
+  else
+    ϕ = R'*s
+    n = 1 + ϕ'*ϕ
+    r = 1/(1+sqrt(1/n))
+    nextR = R - r/n * (R*ϕ)*ϕ' 
   end
 
+  nextσ2 = exp(log(σ2) + 0.015*(α-αstar))
 
-  for l in 2:levels
-    us[l] = rand(proposal_dist,n)
-    y = x + factor^(l-1)*C.L * us[l]
-    forward_logps[l] = backward_logps[1]
-    backward_logps[1] = target(y)
-    for j in 1:l-1
-      rev_y = y - factor^(j-1)*C.L * us[j]
-      backward_logps[j+1] = target(rev_y)
+  next_state = (;iter = iter+1,σ2 = nextσ2, R = nextR)
+
+  if rand() < α
+    return y, logp_y, gradlogp_y, true, next_state
+  end
+
+  return x, logp_x, gradlogp_x, false, next_state
+end
+
+Base.@kwdef @concrete struct PathDelayedRejection <: AbstractMCMCKernel{Val{false}}
+  proposal_dist = Normal()
+  n_stages = 4
+  factor = 0.25
+end
+
+_scaled_logpdf(dist,u,scale) = sum(logpdf(dist,u/scale)) - length(u)*log(scale)
+
+function _scaled_logΔ(proposal_dist,logps,us,factor,bot,top,rev=false)
+  stage = top-bot
+  if stage == 1
+    if rev 
+      return logps[top] + sum(logpdf(proposal_dist,us[bot]-us[top]))
     end
 
-    α = min(1.,exp(logα(forward_logps,backward_logps,l)))
+    return logps[bot] + sum(logpdf(proposal_dist,us[top]-us[bot]))
+  end
+
+  q = if rev
+    _scaled_logpdf(proposal_dist,us[bot]-us[top],factor^(stage-1))
+  else
+    _scaled_logpdf(proposal_dist,us[top]-us[bot],factor^(stage-1))
+  end
+
+  return  q + logsubexp(
+        _scaled_logΔ(proposal_dist,logps,us,factor,bot,top-1,rev),
+        _scaled_logΔ(proposal_dist,logps,us,factor,bot,top-1,!rev),
+      )
+end
+
+function _logα(proposal_dist,logps,us,factor,stage)
+  ux,uy = us[1],us[stage+1]
+  logp_x,logp_y = logps[1],logps[stage+1]
+  forward_Δ = _scaled_logΔ(proposal_dist,logps,us,factor,1,1+stage)
+
+  logps[1],logps[stage+1] = logp_y,logp_x
+  us[1], us[stage+1] = uy,ux
+
+  backward_Δ = _scaled_logΔ(proposal_dist,logps,us,factor,1,1+stage)
+
+  logps[1],logps[stage+1] = logp_x,logp_y
+  us[1], us[stage+1] = ux,uy
+
+  return backward_Δ - forward_Δ
+end
+
+
+function (k::PathDelayedRejection)(target,x,logp_x,C::Cholesky)
+  @unpack proposal_dist,factor,n_stages = k
+  n = length(x)
+
+  us = Vector{Vector{eltype(x)}}(undef,n_stages+1)
+  logps = Vector{typeof(logp_x)}(undef,n_stages+1)
+  us[1] = zeros(n)
+  logps[1] = logp_x
+
+  for i in 1:n_stages
+    us[i+1] = factor^(i-1) * rand(proposal_dist,n)
+    y = x + C.L*us[i+1]
+    logps[i+1] =  LD.logdensity(target,y)
+
+    α = min(1.,exp(_logα(
+      proposal_dist,
+      logps,us,
+      factor,i
+    )))
 
     if rand() < α
-      # Return false so that for the DelayedRejection the acceptance rate
-      # calculated is the one at the first stage
-      return y, backward_logps[1], false
+      # Only a first stage accept returns true so that the externally calculated
+      # acceptance rate is the first stage one -> to adapt the intial proposal
+      # scale
+      return y,logps[i+1], i == 1 ? true : false,C
     end
   end
 
-  return x,target_x, false 
+  return x, logp_x, false, C
 end
 
-Base.@kwdef struct SymmRWMH <: AbstractMCMCKernel
-  proposal_dist::ContinuousUnivariateDistribution = Normal()
+Base.@kwdef @concrete struct RWMH <: AbstractMCMCKernel{Val{false}}
+  proposal_dist = Normal()
 end
 
-function (k::SymmRWMH)(target,x,target_x,C::Cholesky)
+function (k::RWMH)(target,x,logp_x,C::Cholesky)
   @unpack proposal_dist = k
-  y = x + C.L*rand(proposal_dist,length(x))
-  target_y = target(y)
+  u = rand(proposal_dist,length(x))
+  y = x + C.L*u
+  logp_y = LD.logdensity(target,y)
 
-  α = min(1.,exp.(target_y-target_x))
+  α = min(1.,exp.(logp_y + sum(logpdf(proposal_dist,-u)) - logp_x - sum(logpdf(proposal_dist,u))))
   if rand() < α
-    return y, target_y, true
+    return y, logp_y, true, C
   end
 
-  return x, target_x, false
+  return x, logp_x, false, C
 end
 
 
@@ -237,16 +315,110 @@ function _guess_n_starting(n_samples)
   return best
 end
 
+function resample_systematic(
+    rng::Random.AbstractRNG, weights::AbstractVector{<:Real}, n::Integer=length(weights)
+)
+    # check input
+    m = length(weights)
+    m > 0 || error("weight vector is empty")
+
+    # pre-calculations
+    @inbounds v = n * weights[1]
+    u = oftype(v, rand(rng))
+
+    # find all samples
+    samples = Array{Int}(undef, n)
+    sample = 1
+    @inbounds for i in 1:n
+        # as long as we have not found the next sample
+        while v < u
+            # increase and check the sample
+            sample += 1
+            sample > m &&
+                error("sample could not be selected (are the weights normalized?)")
+
+            # update the cumulative sum of weights (scaled by `n`)
+            v += n * weights[sample]
+        end
+
+        # save the next sample
+        samples[i] = sample
+
+        # update `u`
+        u += one(u)
+    end
+
+    return samples
+end
+
+function _default_sampler(ref_logdensity,mul_logdensity)
+  lc = _lowest_capability(ref_logdensity,mul_logdensity)
+  if lc isa LD.LogDensityOrder{0}()
+    return PathDelayedRejection()
+  end
+  return FisherMALA()
+end
+
+abstract type AbstractCovEstimator end
+
+function estimate_cov(_::AbstractCovEstimator,samples,weights) end
+
+struct IdentityCov <: AbstractCovEstimator end
+
+estimate_cov(_::IdentityCov,samples,weights,xs) = fill(Matrix(one(eltype(samples)) * I, size(samples,1),size(samples,1)),length(xs))
+
+Base.@kwdef @concrete struct ParticleCov <: AbstractCovEstimator 
+  method = LinearShrinkage(DiagonalUnequalVariance())
+end
+
+function estimate_cov(c::ParticleCov,samples,weights,xs) 
+  fill(
+    cov(
+      c.method,samples,FrequencyWeights(weights),dims=2
+    )
+    ,length(xs))
+end
+
+Base.@kwdef @concrete struct KernelCov <: AbstractCovEstimator 
+  max_samples = 1000
+  γ = 0.05
+end
+
+function estimate_cov(c::KernelCov,samples,weights,xs)
+  n_samples, ref_samples,wfun = if size(samples,2) > c.max_samples
+    inds = resample_systematic(Random.default_rng(),weights,c.max_samples)
+    c.max_samples, samples[:,inds], i -> 1
+  else
+    n_samples = size(samples,2)
+    n_samples,samples, i -> sqrt(n_samples * weights[i])
+  end
+
+  n_dims = size(samples,1)
+  H = I - ones(n_samples,n_samples)/n_samples
+  M = similar(H,n_dims,n_samples)
+
+  refdists = pairwise(Euclidean(),ref_samples)
+  lengthscale = median(refdists) / sqrt(2) + 1e-8
+
+  # Covariance in kernel space from Kernel Adaptive Metropolis-Hastings
+  xzdists = pairwise(SqEuclidean(),xs,eachcol(ref_samples)) 
+  return map(eachindex(xs)) do i
+    for (j,z) in enumerate(eachcol(ref_samples))
+      @. M[:,j] = wfun(j) * 2/lengthscale^2 * exp(-0.5*xzdists[i,j]/lengthscale^2) * (z - xs[i])
+    end
+    Symmetric(c.γ*I + M * H * M')
+  end
+end
+
 function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
-                        mcmc_kernel::AbstractMCMCKernel = SymmDelayedRejection(),
-                        covariance_method = LinearShrinkage(DiagonalUnequalVariance()),
+                        mcmc_kernel::AbstractMCMCKernel = _default_sampler(ref_logdensity,mul_logdensity),
+                        cov_estimator::AbstractCovEstimator = IdentityCov(),
+                        rng = Random.default_rng(),
                         # Should be much smaller than the number of samples
                         n_starting = _guess_n_starting(size(initial_samples,2)),
-                        target_acceptance_rate = 0.234,
-                        α = 0.5,
                         init_scale = 2.38^2/size(initial_samples,1),
-                        γ = 10.,
-                        ϵ = 1e-8,
+                        γ = 4*log(10),
+                        α = 0.5,
                         parallel_map = map,
                         maxiter = 200,
                         callback=(_) -> false,
@@ -258,18 +430,16 @@ function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
   acceptance_rate = 0.
   samples = copy(initial_samples)
   n_dims, n_samples = size(samples)
+  opt_acceptance_rate = target_acceptance_rate(mcmc_kernel)
 
   loop_prog = ProgressUnknown(desc="Tempering:",showspeed=true,dt=1e-9)
 
-  # For Kernel estimate of the covariance
-  H = I - ones(n_samples,n_samples)/n_samples
-  M = similar(H,n_dims,n_samples)
-  cov_scale = init_scale
-
   chain_length = div(n_samples, n_starting)
 
+  cov_scale = init_scale
+
   ℓ = parallel_map(eachcol(samples)) do c
-    mul_logdensity(c)
+    LD.logdensity(mul_logdensity,c)
   end
   ℓ_adjust  = maximum(ℓ)
   ℓ .-= ℓ_adjust
@@ -292,25 +462,15 @@ function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
 
     wn = w ./ sum(w)
 
-    cw = FrequencyWeights(wn)
-    indices = sample(1:n_samples,cw,n_starting,replace=true)
+    indices = resample_systematic(rng, wn,n_starting) 
 
-    # Covarience estimate with all samples
-    Σ0 = cov(covariance_method,samples,cw,dims=2) 
-    refdists = pairwise(Euclidean(),samples)
-    lengthscale = median(refdists) / sqrt(2) + sqrt(ϵ)
-
+    starting_x = [view(samples,:,i) for i in indices]
+    cov_estimate = estimate_cov(cov_estimator, samples,wn,starting_x)
     chains = let scale = cov_scale
-      parallel_map([view(samples,:,i) for i in indices]) do x 
+      parallel_map(collect(zip(starting_x,cov_estimate))) do (x,Σ)
         interp_density = InterpolatingDensity(ref_logdensity,mul_logdensity,new_β,n_dims)
-        # Kernel Adaptive Metropolis-Hastings
-        xzdists = pairwise(SqEuclidean(),[x],eachcol(samples)) 
-        k = @. exp(-0.5 * xzdists / lengthscale^2)
-        for (j,z) in enumerate(eachcol(samples))
-          @. M[:,j] = 2/lengthscale^2 * k[j] * (z - x)
-        end
-        K = scale * 0.5 * (Σ0 + M * H * M') + ϵ*I
-        mcmc_chain(mcmc_kernel,interp_density,x,cholesky(Symmetric(K)),chain_length)
+        state = init_kernel_state(mcmc_kernel,x,scale,Σ)
+        mcmc_chain(mcmc_kernel,interp_density,x,state,chain_length)
       end
     end
 
@@ -318,19 +478,18 @@ function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
     β = new_β
     offset = 0
     for c in chains
-      s = view(samples,:,(offset+1):(offset+chain_length))
-      copyto!(s,c.samples)
-      # Assumes that calculating the prior is much faster than the likelihood
-      # so it gets the valus from chain
       for j in 1:chain_length
-        ℓ[offset+j] = (c.lps[j]-ref_logdensity(view(c.samples,:,j))) / β
+        samples[:,offset+j] .= c.samples[j]
+        # Assumes that calculating the prior is much faster than the likelihood
+        # so it gets the valus from chain
+        ℓ[offset+j] = (c.lps[j]-LD.logdensity(ref_logdensity,c.samples[j])) / β
       end
       offset += chain_length
     end
 
     acceptance_rate = sum(c.n_accepts for c in chains) / (n_starting * (chain_length-1))
 
-    cov_scale = exp(log(cov_scale) + γ * (acceptance_rate - target_acceptance_rate))
+    cov_scale = exp(log(cov_scale) + γ*(acceptance_rate-opt_acceptance_rate))
 
     ℓ_adjust = maximum(ℓ)
     ℓ .-= ℓ_adjust
