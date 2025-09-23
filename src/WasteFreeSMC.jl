@@ -60,6 +60,7 @@ usesgrad(_::AbstractMCMCKernel{Val{V}}) where {V} = V
 
 Base.@kwdef @concrete struct FisherMALA <: AbstractMCMCKernel{Val{true}}
   λ = 10.
+  ρ = 0.015
   αstar = 0.574
 end
 
@@ -71,7 +72,7 @@ end
 
 function (k::FisherMALA)(target,x,logp_x,gradlogp_x,state)
   @unpack iter,σ2,R = state
-  @unpack λ,αstar = k
+  @unpack λ,ρ,αstar = k
 
   σ2_rel = σ2/(sum(abs2,R)/length(x))
 
@@ -99,7 +100,7 @@ function (k::FisherMALA)(target,x,logp_x,gradlogp_x,state)
     nextR = R - r/n * (R*ϕ)*ϕ' 
   end
 
-  nextσ2 = exp(log(σ2) + 0.015*(α-αstar))
+  nextσ2 = exp(log(σ2) + ρ*(α-αstar))
 
   next_state = (;iter = iter+1,σ2 = nextσ2, R = nextR)
 
