@@ -447,8 +447,12 @@ function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
   ProgressMeter.update!(loop_prog,0)
   iter = 0
   while β < 1 && iter < maxiter
+    push!(trace,(;
+      iter,samples=copy(samples),ℓ=copy(ℓ),
+      ℓ_adjust=copy(ℓ_adjust),
+      cov_scale,β,acceptance_rate,log_evidence
+    ))
     iter += 1
-    push!(trace,(;iter,samples=copy(samples),ℓ,ℓ_adjust,cov_scale,β,acceptance_rate,log_evidence))
 
     if callback(trace)
       @warn "Stopped by callback"
@@ -498,8 +502,10 @@ function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
 
   ProgressMeter.finish!(loop_prog)
 
-  iter += 1
-  push!(trace,(;iter,samples,ℓ,ℓ_adjust,cov_scale,β,acceptance_rate,log_evidence))
+  push!(trace,(;
+    iter,samples,ℓ,ℓ_adjust,
+    cov_scale,β,acceptance_rate,log_evidence
+  ))
 
   if !isone(β)
     @warn "Did not reach β=1 in the give limit of iterations"
