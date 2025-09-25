@@ -13,6 +13,7 @@ using Distances
 using Primes
 using ProgressMeter
 using ConcreteStructs
+using Folds
 
 
 import LogDensityProblems as LD
@@ -398,6 +399,25 @@ function estimate_cov(c::KernelCov,samples,weights,xs)
   end
 end
 
+mutable struct SMCState{T}
+  iter::Int
+  samples::Matrix{T}
+  ℓ::Vector{T}
+  ℓ_adjust::T
+  scales::Vector{T}
+  scale_weights::Vector{T}
+  β::Float64
+  acceptance_rate::Float64
+  log_evidence::T
+end
+
+function SMCState(samples,ℓ,ℓ_adjust,scales,scale_weights)
+  T = promote_type(eltype(samples),eltype(ℓ),eltype(scales),eltype(scale_weights))
+  return SMCState{T}(0,samples,ℓ,ℓ_adjust,scales,scale_weights,0.,0.,zero(T))
+end
+
+
+
 function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
                         mcmc_kernel::AbstractMCMCKernel = _default_sampler(ref_logdensity,mul_logdensity),
                         cov_estimator::AbstractCovEstimator = IdentityCov(),
@@ -412,15 +432,13 @@ function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
                         # Magnitude of the perturbation of the scale estimate
                         perturb_scale = 0.015,
                         α = 0.5,
-                        parallel_map = map,
+                        executor = SequentialEx(),
                         maxiter = 200,
                         callback=(_) -> false,
+                        store_trace = true
                         )
 
-  trace= NamedTuple[]
-  β = 0.
-  log_evidence = 0.
-  acceptance_rate = 0.
+
   samples = copy(initial_samples)
   n_dims, n_samples = size(samples)
 
@@ -428,34 +446,36 @@ function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
 
   chain_length = div(n_samples, n_starting)
 
-  scales = ref_cov_scale * 10 .^ (range(-ϵ,0,length=n_starting))
-  scale_weights = ones(n_starting)
+  # T_logp = Base.return(LD.logdensity,(typeof(mul_logdensity),typeof(first(eachcol(samples)))))
 
-  ℓ = parallel_map(eachcol(samples)) do c
+  ℓ = Folds.map(eachcol(samples),executor) do c
     LD.logdensity(mul_logdensity,c)
   end
   ℓ_adjust  = maximum(ℓ)
   ℓ .-= ℓ_adjust
 
+  state = SMCState(
+    samples,ℓ,ℓ_adjust,
+    ref_cov_scale * 10 .^ (range(-ϵ,0,length=n_starting)),
+    ones(n_starting)
+  )
+  trace = typeof(state)[]
+
   ProgressMeter.update!(loop_prog,0)
-  iter = 0
-  while β < 1 && iter < maxiter
-    push!(trace,(;
-      iter,samples=copy(samples),ℓ=copy(ℓ),
-      ℓ_adjust=copy(ℓ_adjust),scales,scale_weights = copy(scale_weights),
-      β,acceptance_rate,log_evidence
-    ))
-    iter += 1
+  while state.β < 1 && state.iter < maxiter
+    if store_trace
+      push!(trace,deepcopy(state))
+    end
 
     if callback(trace)
       @warn "Stopped by callback"
-      return trace
+      return store_trace ? trace : state
     end
 
-    new_β, w = _beta_and_weights(β,ℓ,α*n_samples)
-    ProgressMeter.next!(loop_prog,showvalues=[("β",new_β),("Maximum ℓ",ℓ_adjust)])
+    new_β, w = _beta_and_weights(state.β,ℓ,α*n_samples)
+    ProgressMeter.next!(loop_prog,showvalues=[("β",new_β),("Maximum ℓ",state.ℓ_adjust)])
 
-    log_evidence += log(mean(w)) + (new_β - β) * ℓ_adjust 
+    state.log_evidence += log(mean(w)) + (new_β - state.β) * ℓ_adjust 
 
     wn = w ./ sum(w)
 
@@ -463,29 +483,28 @@ function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
 
     starting_x = [view(samples,:,i) for i in indices]
     cov_estimate = estimate_cov(cov_estimator, samples,wn,starting_x)
-    chains = parallel_map(collect(zip(starting_x,scales,cov_estimate))) do (x,scale,Σ)
-        interp_density = InterpolatingDensity(ref_logdensity,mul_logdensity,new_β,n_dims)
-        state = init_kernel_state(mcmc_kernel,x,scale,Σ)
-        mcmc_chain(mcmc_kernel,interp_density,x,state,chain_length)
-      end
+    chains = Folds.map(zip(starting_x,state.scales,cov_estimate),executor) do (x,scale,Σ)
+      interp_density = InterpolatingDensity(ref_logdensity,mul_logdensity,new_β,n_dims)
+      kernel_state = init_kernel_state(mcmc_kernel,x,scale,Σ)
+      mcmc_chain(mcmc_kernel,interp_density,x,kernel_state,chain_length)
+    end
 
     # Setup for next iteration
-    β = new_β
+    state.β = new_β
     offset = 0
-    acceptance_rate = 0.
     for c in chains
-      acceptance_rate += c.n_accepts 
       for j in 1:chain_length
-        samples[:,offset+j] .= c.samples[j]
+        state.samples[:,offset+j] .= c.samples[j]
         # Assumes that calculating the prior is much faster than the likelihood
         # so it gets the valus from chain
-        ℓ[offset+j] = (c.lps[j]-LD.logdensity(ref_logdensity,c.samples[j])) / β
+        state.ℓ[offset+j] = (c.lps[j]-LD.logdensity(ref_logdensity,c.samples[j])) / state.β
       end
       offset += chain_length
     end
-    ℓ_adjust = maximum(ℓ)
-    ℓ .-= ℓ_adjust
-    acceptance_rate /= (chain_length-1)*n_starting
+    state.ℓ_adjust = maximum(ℓ)
+    state.ℓ .-= state.ℓ_adjust
+    state.acceptance_rate = sum(c.n_accepts for c in chains) / ((chain_length-1)*n_starting)
+
 
     # Resample scale following 10.1214/13-BA814
     for j in 1:n_starting
@@ -498,36 +517,36 @@ function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
         w += c.α[i] * δ'*(Σ\δ)
       end
       w /= chain_length - 1
-      scale_weights[j] = w
+      state.scale_weights[j] = w
     end
-    scale_weights ./= sum(scale_weights)
-    scale_inds = resample_systematic(rng,scale_weights)
-    scales = scales[scale_inds]
-    for i in eachindex(scales)
+    state.scale_weights ./= sum(state.scale_weights)
+    scale_inds = resample_systematic(rng,state.scale_weights)
+    state.scales = state.scales[scale_inds]
+    for i in eachindex(state.scales)
       # Instead of just the Mixture model from the paper
       # Do also a mixture with the initial uniform distribution
       # so that if the scale changes abruptly between steps 
       # the distribution of scale parameters is not stuck on the old scale
-      if rand() < 0.5 + 0.5*β # it is also tempered
-        scales[i] = exp(log(scales[i]) + perturb_scale*randn())
+      if rand() < 0.5 + 0.5*state.β # it is also tempered
+        state.scales[i] = exp(log(state.scales[i]) + perturb_scale*randn())
       else
-        scales[i] = ref_cov_scale * 10 .^ (-ϵ*rand())
+        state.scales[i] = ref_cov_scale * 10 .^ (-ϵ*rand())
       end
     end
+    state.iter += 1
+  end
+
+  if store_trace
+    push!(trace,state)
   end
 
   ProgressMeter.finish!(loop_prog)
 
-  push!(trace,(;
-    iter,samples,ℓ,ℓ_adjust,scales,scale_weights,
-    β,acceptance_rate,log_evidence
-  ))
-
-  if !isone(β)
+  if !isone(state.β)
     @warn "Did not reach β=1 in the give limit of iterations"
   end
 
-  return trace
+  return store_trace ? trace : state
 end
 
 end # module WasteFreeSMC
