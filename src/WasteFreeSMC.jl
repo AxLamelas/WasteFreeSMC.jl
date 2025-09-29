@@ -473,7 +473,6 @@ function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
     end
 
     new_β, w = _beta_and_weights(state.β,ℓ,α*n_samples)
-    ProgressMeter.next!(loop_prog,showvalues=[("β",new_β),("Maximum ℓ",state.ℓ_adjust)])
 
     state.log_evidence += log(mean(w)) + (new_β - state.β) * ℓ_adjust 
 
@@ -534,6 +533,14 @@ function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
       end
     end
     state.iter += 1
+
+    ProgressMeter.next!(loop_prog,
+                    showvalues=[
+                    ("β",state.β),
+                    ("Maximum ℓ",state.ℓ_adjust),
+                    ("Acceptance rate",state.acceptance_rate)
+                    ])
+
   end
 
   if store_trace
