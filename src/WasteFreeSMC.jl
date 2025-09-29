@@ -338,7 +338,7 @@ function resample_systematic(
 
     # pre-calculations
     @inbounds v = n * weights[1]
-    u = oftype(v, rand)
+    u = oftype(v, rand())
 
     # find all samples
     samples = Array{Int}(undef, n)
@@ -426,8 +426,6 @@ end
 
 """
   stabilized_map(f,x,map_func)
-
-  map_func can be map, pmap, tmap ...
 
   Uses the `Base.map` infrastructure to infer the return type of the map, using 
   a type assertion to enforce it.
