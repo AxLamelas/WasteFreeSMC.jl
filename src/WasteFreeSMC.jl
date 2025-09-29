@@ -14,10 +14,19 @@ using Primes
 using ProgressMeter
 using ConcreteStructs
 
-using Metadata
-
-
 import LogDensityProblems as LD
+
+"""
+  Number that has some metadata, but promotes to val
+  so that if an operation is performed the metadata is dropped
+"""
+struct MetaNumber{T<:Real,I} <: Real
+  val::T
+  info::I
+end
+
+Base.promote(a::MetaNumber,b,cs...) = Base.promote(a.val,b,cs...)
+Base.promote(a,b::MetaNumber,cs...) = Base.promote(a,b.val,cs...)
 
 struct InterpolatingDensity{P,L}
   ref::P
@@ -39,13 +48,13 @@ LD.capabilities(ℓ::InterpolatingDensity) = _lowest_capability(ℓ.ref,ℓ.mul)
 function LD.logdensity(ℓ::InterpolatingDensity,θ)
   mul = LD.logdensity(ℓ.mul,θ) 
   ref = LD.logdensity(ℓ.ref,θ) 
-  attach_metadata((ℓ.β * mul + ref),(;mul,ref))
+  MetaNumber(ℓ.β * mul + ref,(;mul,ref))
 end
 
 function LD.logdensity_and_gradient(ℓ::InterpolatingDensity,θ)
   ref,refgrad = LD.logdensity_and_gradient(ℓ.ref,θ)
   mul,mulgrad = LD.logdensity_and_gradient(ℓ.mul,θ)
-  attach_metadata(ℓ.β * mul + ref,(;mul,mulgrad,ref,refgrad)), ℓ.β * mulgrad + refgrad
+  MetaNumber(ℓ.β * mul + ref,(;mul,mulgrad,ref,refgrad)), ℓ.β * mulgrad + refgrad
 end
 
 norm2(v::AbstractVector) = dot(v,v)
@@ -204,7 +213,7 @@ function mcmc_chain(mcmc_kernel::AbstractMCMCKernel{Val{true}},target,x,state,n_
   samples = Vector{Vector{T}}(undef,n_samples)
   lps = Vector{typeof(ref_lp)}(undef,n_samples)
   gradlps = Vector{Vector{T}}(undef,n_samples)
-  α = Vector{typeof(ref_lp)}(undef,n_samples-1)
+  α = Vector{T}(undef,n_samples-1)
 
   samples[1] = x
   lps[1] = ref_lp
@@ -227,7 +236,7 @@ function mcmc_chain(mcmc_kernel::AbstractMCMCKernel{Val{false}},target,x,state,n
   T = eltype(x)
   samples = Vector{Vector{T}}(undef,n_samples)
   lps = Vector{typeof(ref_lp)}(undef,n_samples)
-  α = Vector{typeof(ref_lp)}(undef,n_samples-1)
+  α = Vector{T}(undef,n_samples-1)
 
   samples[1] = x
   lps[1] = ref_lp
@@ -433,7 +442,7 @@ end
 function stabilized_map(f,x,map_func)
   gen = Base.Generator(f,x)
   T = Base.@default_eltype gen
-  return map_func(identity,gen)::Vector{T}
+  return map_func(f,x)::Vector{T}
 end
 
 
@@ -514,7 +523,7 @@ function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
     for c in chains
       for j in 1:chain_length
         state.samples[:,offset+j] .= c.samples[j]
-        state.ℓ[offset+j] = c.lps[j].mul 
+        state.ℓ[offset+j] = c.lps[j].info.mul 
       end
       offset += chain_length
     end
