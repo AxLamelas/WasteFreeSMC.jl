@@ -13,7 +13,8 @@ using Distances
 using Primes
 using ProgressMeter
 using ConcreteStructs
-using Folds
+
+using Metadata
 
 
 import LogDensityProblems as LD
@@ -36,13 +37,15 @@ end
 LD.capabilities(ℓ::InterpolatingDensity) = _lowest_capability(ℓ.ref,ℓ.mul)
 
 function LD.logdensity(ℓ::InterpolatingDensity,θ)
-  ℓ.β * LD.logdensity(ℓ.mul,θ) + LD.logdensity(ℓ.ref,θ) 
+  mul = LD.logdensity(ℓ.mul,θ) 
+  ref = LD.logdensity(ℓ.ref,θ) 
+  attach_metadata((ℓ.β * mul + ref),(;mul,ref))
 end
 
 function LD.logdensity_and_gradient(ℓ::InterpolatingDensity,θ)
   ref,refgrad = LD.logdensity_and_gradient(ℓ.ref,θ)
   mul,mulgrad = LD.logdensity_and_gradient(ℓ.mul,θ)
-  ℓ.β * mul + ref, ℓ.β * mulgrad + refgrad
+  attach_metadata(ℓ.β * mul + ref,(;mul,mulgrad,ref,refgrad)), ℓ.β * mulgrad + refgrad
 end
 
 norm2(v::AbstractVector) = dot(v,v)
@@ -237,36 +240,58 @@ function mcmc_chain(mcmc_kernel::AbstractMCMCKernel{Val{false}},target,x,state,n
   return (;n_accepts,samples,lps,state,α)
 end
 
+
+mutable struct SMCState{T}
+  iter::Int
+  samples::Matrix{T}
+  W::Vector{T}
+  ℓ::Vector{T}
+  ℓ_adjust::T
+  scales::Vector{T}
+  scale_weights::Vector{T}
+  β::Float64
+  acceptance_rate::Float64
+  log_evidence::T
+end
+
+function SMCState(samples,W,ℓ,ℓ_adjust,scales,scale_weights)
+  T = promote_type(eltype(samples),eltype(ℓ),eltype(scales),eltype(scale_weights))
+  return SMCState{T}(0,samples,W,ℓ,ℓ_adjust,scales,scale_weights,0.,0.,zero(T))
+end
+
+
 """
-    _beta_and_weights(β, likelihood, target)
+  _next_β(state::SMCstate, metric_target)
 
 Compute the next value for `β` and the nominal weights `w` using bisection.
+Uses the conditional effective sample size (https://www.jstor.org/stable/44861887) as a metric.
 """
-function _beta_and_weights(β::Real, adjusted_likelihood::AbstractVector{<:Real}, target)
-  low = β
-  high = 2one(β)
+function _next_β(state::SMCState,metric_target)
+  low = state.β
+  high = 2one(state.β)
 
   local x # Declare variables so they are visible outside the loop
 
-  w = similar(adjusted_likelihood)
+  w = similar(state.ℓ)
 
   while (high - low) / ((high + low) / 2) > 1e-6 && high > eps()
     x = (high + low) / 2
-    w .= exp.((x - β) .* adjusted_likelihood)
-    w ./= sum(w)
-    ess = 1/sum(abs2,w)
-    if ess == target
+    w .= exp.((x - state.β) .* state.ℓ)
+    cess = sum(state.W[i]*w[i] for i in eachindex(w))^2/
+      mean(state.W[i]*(w[i])^2 for i in eachindex(w))
+
+    if cess == metric_target
       break
     end
 
-    if ess < target
+    if cess < metric_target
       high = x # Reduce high
     else
       low = x # Increase low
     end
   end
 
-  return min(1, x), w
+  return min(1, x)
 end
 
 function divisors(n)
@@ -305,7 +330,7 @@ function _guess_n_starting(n_samples)
 end
 
 function resample_systematic(
-    rng::Random.AbstractRNG, weights::AbstractVector{<:Real}, n::Integer=length(weights)
+    weights::AbstractVector{<:Real}, n::Integer=length(weights)
 )
     # check input
     m = length(weights)
@@ -313,7 +338,7 @@ function resample_systematic(
 
     # pre-calculations
     @inbounds v = n * weights[1]
-    u = oftype(v, rand(rng))
+    u = oftype(v, rand)
 
     # find all samples
     samples = Array{Int}(undef, n)
@@ -375,7 +400,7 @@ end
 
 function estimate_cov(c::KernelCov,samples,weights,xs)
   n_samples, ref_samples,wfun = if size(samples,2) > c.max_samples
-    inds = resample_systematic(Random.default_rng(),weights,c.max_samples)
+    inds = resample_systematic(weights,c.max_samples)
     c.max_samples, samples[:,inds], i -> 1
   else
     n_samples = size(samples,2)
@@ -399,31 +424,29 @@ function estimate_cov(c::KernelCov,samples,weights,xs)
   end
 end
 
-mutable struct SMCState{T}
-  iter::Int
-  samples::Matrix{T}
-  ℓ::Vector{T}
-  ℓ_adjust::T
-  scales::Vector{T}
-  scale_weights::Vector{T}
-  β::Float64
-  acceptance_rate::Float64
-  log_evidence::T
-end
+"""
+  stabilized_map(f,x,map_func)
 
-function SMCState(samples,ℓ,ℓ_adjust,scales,scale_weights)
-  T = promote_type(eltype(samples),eltype(ℓ),eltype(scales),eltype(scale_weights))
-  return SMCState{T}(0,samples,ℓ,ℓ_adjust,scales,scale_weights,0.,0.,zero(T))
-end
+  map_func can be map, pmap, tmap ...
 
+  Uses the `Base.map` infrastructure to infer the return type of the map, using 
+  a type assertion to enforce it.
+"""
+function stabilized_map(f,x,map_func)
+  gen = Base.Generator(f,x)
+  T = Base.@default_eltype gen
+  return map_func(identity,gen)::Vector{T}
+end
 
 
 function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
                         mcmc_kernel::AbstractMCMCKernel = _default_sampler(ref_logdensity,mul_logdensity),
                         cov_estimator::AbstractCovEstimator = IdentityCov(),
-                        rng = Random.default_rng(),
                         # Should be much smaller than the number of samples
                         n_starting = _guess_n_starting(size(initial_samples,2)),
+                        # Normalized weights of the samples according to the
+                        # reference distribution
+                        initial_weights = fill(1/size(initial_samples,2),size(initial_samples,2)),
                         # Reference scale
                         ref_cov_scale = 2.38^2/size(initial_samples,1),
                         # Search scales up to `ϵ` orders of magnitude lower than 
@@ -432,7 +455,7 @@ function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
                         # Magnitude of the perturbation of the scale estimate
                         perturb_scale = 0.015,
                         α = 0.5,
-                        executor = SequentialEx(),
+                        map_func = map,
                         maxiter = 200,
                         callback=(_) -> false,
                         store_trace = true
@@ -446,16 +469,14 @@ function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
 
   chain_length = div(n_samples, n_starting)
 
-  # T_logp = Base.return(LD.logdensity,(typeof(mul_logdensity),typeof(first(eachcol(samples)))))
-
-  ℓ = Folds.map(eachcol(samples),executor) do c
+  ℓ = stabilized_map(eachcol(samples),map_func) do c
     LD.logdensity(mul_logdensity,c)
   end
   ℓ_adjust  = maximum(ℓ)
   ℓ .-= ℓ_adjust
 
   state = SMCState(
-    samples,ℓ,ℓ_adjust,
+    samples,initial_weights,ℓ,ℓ_adjust,
     ref_cov_scale * 10 .^ (range(-ϵ,0,length=n_starting)),
     ones(n_starting)
   )
@@ -463,6 +484,8 @@ function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
 
   ProgressMeter.update!(loop_prog,0)
   while state.β < 1 && state.iter < maxiter
+    # `state` contains information regarding the previous step in the sequence
+
     if store_trace
       push!(trace,deepcopy(state))
     end
@@ -472,38 +495,46 @@ function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
       return store_trace ? trace : state
     end
 
-    new_β, w = _beta_and_weights(state.β,ℓ,α*n_samples)
 
-    state.log_evidence += log(mean(w)) + (new_β - state.β) * ℓ_adjust 
+    # Determines the current distribution in the sequence
+    new_β = _next_β(state,α*n_samples)
 
-    wn = w ./ sum(w)
-
-    indices = resample_systematic(rng, wn,n_starting) 
+    # Resample 
+    indices = resample_systematic(state.W,n_starting) 
 
     starting_x = [view(samples,:,i) for i in indices]
-    cov_estimate = estimate_cov(cov_estimator, samples,wn,starting_x)
-    chains = Folds.map(zip(starting_x,state.scales,cov_estimate),executor) do (x,scale,Σ)
+    cov_estimate = estimate_cov(cov_estimator, samples,state.W,starting_x)
+    chains = stabilized_map(zip(starting_x,state.scales,cov_estimate),map_func) do (x,scale,Σ)
       interp_density = InterpolatingDensity(ref_logdensity,mul_logdensity,new_β,n_dims)
       kernel_state = init_kernel_state(mcmc_kernel,x,scale,Σ)
       mcmc_chain(mcmc_kernel,interp_density,x,kernel_state,chain_length)
     end
 
-    # Setup for next iteration
-    state.β = new_β
+    # Update the state
+    
     offset = 0
     for c in chains
       for j in 1:chain_length
         state.samples[:,offset+j] .= c.samples[j]
-        # Assumes that calculating the prior is much faster than the likelihood
-        # so it gets the valus from chain
-        state.ℓ[offset+j] = (c.lps[j]-LD.logdensity(ref_logdensity,c.samples[j])) / state.β
+        state.ℓ[offset+j] = c.lps[j].mul 
       end
       offset += chain_length
     end
     state.ℓ_adjust = maximum(ℓ)
     state.ℓ .-= state.ℓ_adjust
-    state.acceptance_rate = sum(c.n_accepts for c in chains) / ((chain_length-1)*n_starting)
+    
+    # New weights do no depend on the previous weights due to resampling
+    # at every iteration
+    state.W = exp.((new_β-state.β) .* state.ℓ)
+    state.log_evidence += log(mean(state.W)) + (new_β - state.β) * ℓ_adjust 
+    
+    # Normalize weights
+    state.W ./= sum(state.W)
 
+    state.β = new_β
+
+    # Average acceptance rate of the chains
+    state.acceptance_rate = sum(c.n_accepts for c in chains) / ((chain_length-1)*n_starting)
 
     # Resample scale following 10.1214/13-BA814
     for j in 1:n_starting
@@ -519,7 +550,7 @@ function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
       state.scale_weights[j] = w
     end
     state.scale_weights ./= sum(state.scale_weights)
-    scale_inds = resample_systematic(rng,state.scale_weights)
+    scale_inds = resample_systematic(state.scale_weights)
     state.scales = state.scales[scale_inds]
     for i in eachindex(state.scales)
       # Instead of just the Mixture model from the paper
@@ -538,6 +569,7 @@ function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
                     showvalues=[
                     ("β",state.β),
                     ("Maximum ℓ",state.ℓ_adjust),
+                    ("Log evidence",state.log_evidence),
                     ("Acceptance rate",state.acceptance_rate)
                     ])
 
