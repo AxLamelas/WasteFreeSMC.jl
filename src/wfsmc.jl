@@ -1,6 +1,7 @@
 function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
                         mcmc_kernel::AbstractMCMCKernel = _default_sampler(ref_logdensity,mul_logdensity),
                         cov_estimator::AbstractCovEstimator = IdentityCov(),
+                        resampler::AbstractResampler = ResidualResampler(),
                         # Should be much smaller than the number of samples
                         n_starting = _guess_n_starting(size(initial_samples,2)),
                         # Normalized weights of the samples according to the
@@ -59,7 +60,7 @@ function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
     new_β = _next_β(state,α*n_samples)
 
     # Resample 
-    indices = resample_systematic(state.W,n_starting) 
+    indices = resampler(state.W,n_starting) 
 
     starting_x = [view(samples,:,i) for i in indices]
     cov_estimate = estimate_cov(cov_estimator, samples,state.W,starting_x)
