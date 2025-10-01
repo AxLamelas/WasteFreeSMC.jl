@@ -1,6 +1,6 @@
 module WasteFreeSMC
 
-export waste_free_smc
+export waste_free_smc, smc
 
 using CovarianceEstimation
 using StatsBase
@@ -23,6 +23,7 @@ include("mcmc_chain.jl")
 include("utils.jl")
 include("cov_estimators.jl")
 include("wfsmc.jl")
+include("smc.jl")
 
 
 
