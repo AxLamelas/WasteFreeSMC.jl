@@ -119,7 +119,7 @@ function smc(ref_logdensity,mul_logdensity,initial_samples;
       # Do also a mixture with the initial uniform distribution
       # so that if the scale changes abruptly between steps 
       # the distribution of scale parameters is not stuck on the old scale
-      if rand() < 0.5 + 0.5*state.β # it is also tempered
+      if rand() < 0.75 + 0.25*state.β # it is also tempered
         state.scales[i] = exp(log(state.scales[i]) + perturb_scale*randn())
       else
         state.scales[i] = ref_cov_scale * 10 .^ (-ϵ*rand())
