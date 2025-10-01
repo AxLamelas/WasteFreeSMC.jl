@@ -9,6 +9,13 @@ end
 
 Base.promote(a::MetaNumber,b,cs...) = Base.promote(a.val,b,cs...)
 Base.promote(a,b::MetaNumber,cs...) = Base.promote(a,b.val,cs...)
+Base.promote(a::MetaNumber,b::MetaNumber,cs...) = Base.promote(a.val,b.val,cs...)
+
+Base.:(+)(x::T, y::T) where {T<:MetaNumber} = x.val+y.val
+Base.:(*)(x::T, y::T) where {T<:MetaNumber} = x.val*y.val
+Base.:(-)(x::T, y::T) where {T<:MetaNumber} = x.val-y.val
+Base.:(/)(x::T, y::T) where {T<:MetaNumber} = x.val/y.val
+Base.:(^)(x::T, y::T) where {T<:MetaNumber} = x.val^y.val
 
 struct TemperedLogDensity{P,L}
   ref::P
