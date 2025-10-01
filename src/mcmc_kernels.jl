@@ -61,6 +61,26 @@ function (k::FisherMALA)(target,x,logp_x,gradlogp_x,state)
   return x, logp_x, gradlogp_x, false, α, next_state
 end
 
+struct MALA <: AbstractMCMCKernel{Val{true}} end
+
+function (k::MALA)(target,x,logp_x,gradlogp_x,C::Cholesky)
+  u = randn(length(x))
+  y = x + 1/2*C.L*(C.L'*gradlogp_x) + C.L*u
+
+  logp_y,gradlogp_y = LD.logdensity_and_gradient(target,y)
+  
+  α = min(1.,exp(logp_y-logp_x +
+                  1/2*(x-y-1/4*C.L*(C.L'*gradlogp_y))'*gradlogp_y -
+                  1/2*(y-x-1/4*C.L*(C.L'*gradlogp_x))'*gradlogp_x 
+                  ))
+
+  if rand() < α
+    return y, logp_y, gradlogp_y, true, α, C
+  end
+
+  return x, logp_x, gradlogp_x, false, α, C
+end
+
 Base.@kwdef @concrete struct PathDelayedRejection <: AbstractMCMCKernel{Val{false}}
   proposal_dist = Normal()
   n_stages = 4
