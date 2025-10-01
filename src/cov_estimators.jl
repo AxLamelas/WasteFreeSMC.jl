@@ -20,12 +20,13 @@ end
 
 Base.@kwdef @concrete struct KernelCov <: AbstractCovEstimator 
   max_samples = 1000
+  resampler = ResidualResampler() 
   γ = 0.05
 end
 
 function estimate_cov(c::KernelCov,samples,weights,xs)
   n_samples, ref_samples,wfun = if size(samples,2) > c.max_samples
-    inds = resample_systematic(weights,c.max_samples)
+    inds = c.resampler(weights,c.max_samples)
     c.max_samples, samples[:,inds], i -> 1
   else
     n_samples = size(samples,2)
