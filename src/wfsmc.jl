@@ -110,7 +110,7 @@ function waste_free_smc(ref_logdensity,mul_logdensity,initial_samples;
       state.scale_weights[j] = w
     end
     state.scale_weights ./= sum(state.scale_weights)
-    scale_inds = resample_systematic(state.scale_weights)
+    scale_inds = resampler(state.scale_weights)
     state.scales = state.scales[scale_inds]
     for i in eachindex(state.scales)
       # Instead of just the Mixture model from the paper
